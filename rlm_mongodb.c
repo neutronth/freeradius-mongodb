@@ -29,7 +29,6 @@ RCSID("$Id$")
 #include <freeradius-devel/token.h>
 
 #include <string.h>
-#include <talloc.h>
 
 #ifdef HAVE_PTHREAD_H
 #include <pthread.h>
