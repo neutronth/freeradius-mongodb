@@ -241,10 +241,29 @@ static int mongodb_cursor_getvpdata (bson_cursor *data, VALUE_PAIR **first_pair)
       }
     }
 
+    if (!attribute || attribute[0] == '\0') {
+      radlog (L_ERR, "rlm_mongodb: The 'attribute' field is empty or NULL, "
+                     "skipping");
+      goto next;
+    }
+
     char buf[MAX_STRING_LEN];
     FR_TOKEN operator = T_EOL;
     if (op && op[0] != '\0') {
       operator = gettoken (&op, buf, sizeof (buf));
+
+      if ((operator < T_OP_ADD) ||
+          (operator > T_OP_CMP_EQ)) {
+        radlog (L_ERR, "rlm_mongodb: Invalid operator '%s' for attribute %s",
+                op, attribute);
+        goto next;
+      }
+    } else {
+      operator = T_OP_CMP_EQ;
+      radlog (L_ERR, "rlm_mongodb: The 'op' field for attribute '%s' is NULL, "
+              "or non-existent.", attribute);
+      radlog (L_ERR, "rlm_mongodb: You MUST FIX THIS if you want the "
+              "configuration to behave as you expect.");
     }
 
     VALUE_PAIR *new_pair = pairmake (attribute, value, operator);
@@ -256,6 +275,7 @@ static int mongodb_cursor_getvpdata (bson_cursor *data, VALUE_PAIR **first_pair)
       is_fail = 1;
     }
 
+next:
     bson_cursor_free (attr);
     bson_free (doc);
   }
