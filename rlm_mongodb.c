@@ -211,7 +211,8 @@ static int mongodb_return_conn (MONGODB_INST *inst,
   return ret == TRUE ? 0 : -1;
 }
 
-static int mongodb_cursor_getvpdata (bson_cursor *data, VALUE_PAIR **first_pair)
+static int mongodb_cursor_getvpdata (bson_cursor *data, VALUE_PAIR **first_pair,
+                                     const char *def_attr)
 {
   int is_fail    = 0;
   bson *array = NULL;
@@ -220,16 +221,42 @@ static int mongodb_cursor_getvpdata (bson_cursor *data, VALUE_PAIR **first_pair)
   bson_cursor *c = bson_cursor_new (array);
 
   while (bson_cursor_next (c) && !is_fail) {
-    if (bson_cursor_type (c) != BSON_TYPE_DOCUMENT)
+    const char *attribute = NULL;
+    const char *op        = NULL;
+    const char *value     = NULL;
+
+    if (bson_cursor_type (c) != BSON_TYPE_DOCUMENT) {
+      if (def_attr) {
+        attribute = def_attr;
+
+        switch (bson_cursor_type (c)) {
+          case BSON_TYPE_STRING:
+            bson_cursor_get_string (c, &value);
+            break;
+          default:
+            radlog (L_ERR, "rlm_mongodb: Unsupport getting non string value from"
+                    "non attribute-value pair for '%s'", def_attr);
+            break;
+        }
+
+        if (value) {
+          VALUE_PAIR *new_pair = pairmake (attribute, value, T_OP_CMP_EQ);
+          if (new_pair) {
+            pairadd (first_pair, new_pair);
+          } else {
+            radlog (L_ERR, "rlm_mongodb: Failed to create the pair: %s",
+                    fr_strerror ());
+          }
+        }
+      }
+
       continue;
+    }
 
     bson *doc = NULL;
     bson_cursor_get_document (c, &doc);
     bson_cursor *attr = bson_cursor_new (doc);
 
-    const char *attribute = NULL;
-    const char *op        = NULL;
-    const char *value     = NULL;
 
     while (bson_cursor_next (attr)) {
       if (strcmp (bson_cursor_key (attr), "attribute") == 0) {
@@ -288,7 +315,7 @@ next:
 
 static int mongodb_getvpdata (MONGODB_INST *inst, REQUEST *request,
                               const char *collection, bson *query, bson *select,
-                              VALUE_PAIR **first_pair)
+                              VALUE_PAIR **first_pair, const char *def_attr)
 {
   int docs_count = 0; 
   mongo_sync_pool_connection *conn = mongodb_get_conn (inst);
@@ -305,13 +332,14 @@ static int mongodb_getvpdata (MONGODB_INST *inst, REQUEST *request,
                             0, 0, 3, query, select);
 
   if (!p) {
-    docs_count = -1;
+    docs_count = 0;
     goto out;
   }
 
   sc = mongo_sync_cursor_new ((mongo_sync_connection *) conn, collection, p);
 
   if (!sc) {
+    radlog_request (L_ERR, 0, request, "Error create new cursor");
     docs_count = -1;
     goto out;
   }
@@ -339,7 +367,7 @@ static int mongodb_getvpdata (MONGODB_INST *inst, REQUEST *request,
         continue;
       }
 
-      fail = mongodb_cursor_getvpdata (doc, first_pair);
+      fail = mongodb_cursor_getvpdata (doc, first_pair, def_attr);
 
       if (!fail)
         docs_count++;
@@ -378,7 +406,8 @@ static int mongodb_user_check (MONGODB_INST *inst, REQUEST *request,
   select = bson_build (BSON_TYPE_INT32, "check", 1, BSON_TYPE_NONE);
   bson_finish (select);
 
-  docs_count = mongodb_getvpdata (inst, request, inst->col_users, query, select, pair);
+  docs_count = mongodb_getvpdata (inst, request, inst->col_users, query,
+                                  select, pair, NULL);
 
   bson_free (query);
   bson_free (select);
@@ -401,7 +430,60 @@ static int mongodb_user_reply (MONGODB_INST *inst, REQUEST *request,
   select = bson_build (BSON_TYPE_INT32, "reply", 1, BSON_TYPE_NONE);
   bson_finish (select);
 
-  docs_count = mongodb_getvpdata (inst, request, inst->col_users, query, select, pair);
+  docs_count = mongodb_getvpdata (inst, request, inst->col_users, query,
+                                  select, pair, NULL);
+
+  bson_free (query);
+  bson_free (select);
+
+  return docs_count;
+}
+
+static int mongodb_group_check (MONGODB_INST *inst, REQUEST *request,
+                                const char *groupname, VALUE_PAIR **pair)
+{
+  bson       *query  = NULL;
+  bson       *select = NULL;
+  int         docs_count = 0;
+
+  if (!groupname || groupname[0] == '\0')
+    return -1;
+
+  query = bson_build (BSON_TYPE_STRING, "groupname", groupname, -1,
+                      BSON_TYPE_NONE);
+  bson_finish (query);
+
+  select = bson_build (BSON_TYPE_INT32, "check", 1, BSON_TYPE_NONE);
+  bson_finish (select);
+
+  docs_count = mongodb_getvpdata (inst, request, inst->col_groups, query,
+                                  select, pair, NULL);
+
+  bson_free (query);
+  bson_free (select);
+
+  return docs_count;
+}
+
+static int mongodb_group_reply (MONGODB_INST *inst, REQUEST *request,
+                                const char *groupname, VALUE_PAIR **pair)
+{
+  bson       *query  = NULL;
+  bson       *select = NULL;
+  int         docs_count = 0;
+
+  if (!groupname || groupname[0] == '\0')
+    return -1;
+
+  query = bson_build (BSON_TYPE_STRING, "groupname", groupname, -1,
+                      BSON_TYPE_NONE);
+  bson_finish (query);
+
+  select = bson_build (BSON_TYPE_INT32, "reply", 1, BSON_TYPE_NONE);
+  bson_finish (select);
+
+  docs_count = mongodb_getvpdata (inst, request, inst->col_groups, query,
+                                  select, pair, NULL);
 
   bson_free (query);
   bson_free (select);
@@ -414,6 +496,80 @@ static int fallthrough (VALUE_PAIR *vp)
   VALUE_PAIR *ft = pairfind (vp, PW_FALL_THROUGH);
 
   return ft ? ft->vp_integer : 0;
+}
+
+static int mongodb_user_getgroups (MONGODB_INST *inst, REQUEST *request,
+                                   VALUE_PAIR **pair)
+{
+  bson       *query  = NULL;
+  bson       *select = NULL;
+  const char *username   = request->username->vp_strvalue;
+  int         docs_count = 0;
+
+  query = bson_build (BSON_TYPE_STRING, "username", username, -1,
+                      BSON_TYPE_NONE);
+  bson_finish (query);
+
+  select = bson_build (BSON_TYPE_INT32, "groups", 1, BSON_TYPE_NONE);
+  bson_finish (select);
+
+  docs_count = mongodb_getvpdata (inst, request, inst->col_users, query,
+                                  select, pair, "Group");
+
+  bson_free (query);
+  bson_free (select);
+
+  return docs_count;
+}
+
+static int mongodb_process_groups (MONGODB_INST *inst, REQUEST *request,
+                                   int *dofallthrough)
+{
+  VALUE_PAIR *groups = NULL;
+  int docs_count = mongodb_user_getgroups (inst, request, &groups);
+  int found = 0;
+
+  if (docs_count <= 0) {
+    return docs_count;
+  }
+
+  VALUE_PAIR *it = NULL;
+
+  for (it = groups; it != NULL && *dofallthrough; it = it->next) {
+    VALUE_PAIR *check_items = NULL;
+    VALUE_PAIR *reply_items = NULL;
+
+    docs_count = mongodb_group_check (inst, request, it->vp_strvalue,
+                                      &check_items);
+
+    if (docs_count > 0) {
+      if (paircompare (request, request->packet->vps, check_items,
+            &request->reply->vps) == 0) {
+        found = 1;
+        RDEBUG2 ("User %s is in group %s", request->username->vp_strvalue,
+                 it->vp_strvalue);
+
+        docs_count = mongodb_group_reply (inst, request, it->vp_strvalue,
+                                          &reply_items);
+
+        *dofallthrough = fallthrough (reply_items);
+        pairmove (&request->config_items, &check_items);
+        pairmove (&request->reply->vps,   &reply_items);
+
+        pairfree (&check_items);
+        pairfree (&reply_items);
+      }
+    } else if (docs_count < 0) {
+      radlog_request (L_ERR, 0, request,
+                      "Error retrieving check pairs for group %s",
+                      it->vp_strvalue);
+      found = -1;
+      break;
+    }
+  }
+
+  pairfree (&groups);
+  return found;
 }
 
 static int mongodb_authorize (void *instance, REQUEST *request)
@@ -456,6 +612,16 @@ static int mongodb_authorize (void *instance, REQUEST *request)
 skipreply:
   pairfree (&check_items);
   pairfree (&reply_items);
+
+  if (dofallthrough) {
+    docs_count = mongodb_process_groups (inst, request, &dofallthrough);
+
+    if (docs_count < 0) {
+      radlog_request (L_ERR, 0, request, "Error processing groups; "
+                      "rejecting user");
+      goto error;
+    }
+  }
 
   goto out;
 
