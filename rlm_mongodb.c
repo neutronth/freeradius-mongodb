@@ -378,6 +378,7 @@ static int mongodb_getvpdata (MONGODB_INST *inst, REQUEST *request,
       bson_cursor_free (doc);
     }
 
+    bson_cursor_free (slc);
     bson_free (result);
   }
 
@@ -558,9 +559,6 @@ static int mongodb_process_groups (MONGODB_INST *inst, REQUEST *request,
         *dofallthrough = fallthrough (reply_items);
         pairmove (&request->config_items, &check_items);
         pairmove (&request->reply->vps,   &reply_items);
-
-        pairfree (&check_items);
-        pairfree (&reply_items);
       }
     } else if (docs_count < 0) {
       radlog_request (L_ERR, 0, request,
@@ -569,6 +567,9 @@ static int mongodb_process_groups (MONGODB_INST *inst, REQUEST *request,
       found = -1;
       break;
     }
+
+    pairfree (&check_items);
+    pairfree (&reply_items);
   }
 
   pairfree (&groups);
