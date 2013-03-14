@@ -259,6 +259,9 @@ static int mongodb_cursor_getvpdata (bson_cursor *data, VALUE_PAIR **first_pair,
 
 
     while (bson_cursor_next (attr)) {
+      if (bson_cursor_type (attr) != BSON_TYPE_STRING)
+        continue;
+
       if (strcmp (bson_cursor_key (attr), "attribute") == 0) {
         bson_cursor_get_string (attr, &attribute);
       } else if (strcmp (bson_cursor_key (attr), "op") == 0) {
