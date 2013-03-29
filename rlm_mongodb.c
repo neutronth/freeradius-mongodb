@@ -349,6 +349,7 @@ static int mongodb_getvpdata (MONGODB_INST *inst, REQUEST *request,
   if (!sc) {
     radlog_request (L_ERR, 0, request, "Error create new cursor");
     docs_count = -1;
+    mongo_wire_packet_free (p);
     goto out;
   }
 
@@ -818,6 +819,7 @@ static int mongodb_accounting_prestop (MONGODB_INST *inst,
   if (!sc) {
     radlog_request (L_ERR, 0, request, "Error create new cursor");
     found = -1;
+    mongo_wire_packet_free (p);
     goto out;
   }
 
