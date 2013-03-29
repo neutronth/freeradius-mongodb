@@ -29,6 +29,7 @@ RCSID("$Id$")
 #include <freeradius-devel/token.h>
 
 #include <string.h>
+#include <sys/time.h>
 
 #ifdef HAVE_PTHREAD_H
 #include <pthread.h>
@@ -51,6 +52,7 @@ typedef struct rlm_mongodb_t {
   int const         numconns;
   char              col_users[256];
   char              col_groups[256];
+  char              col_acct[256];
   int const         read_groups;
 
 #ifdef HAVE_PTHREAD_H
@@ -182,8 +184,11 @@ static int mongodb_instantiate (CONF_SECTION *conf, void **instance)
             "%s.%s", inst->database, "users");
   snprintf (inst->col_groups, sizeof (inst->col_groups) - 1,
             "%s.%s", inst->database, "groups");
+  snprintf (inst->col_acct, sizeof (inst->col_acct) - 1,
+            "%s.%s", inst->database, "acct");
   inst->col_users[sizeof (inst->col_users) - 1]   = '\0';
   inst->col_groups[sizeof (inst->col_groups) - 1] = '\0';
+  inst->col_acct[sizeof (inst->col_acct) - 1] = '\0';
 
   *instance = inst;
 
@@ -639,6 +644,180 @@ out:
   return ret;
 }
 
+static int mongodb_accounting_update (MONGODB_INST *inst, REQUEST *request,
+                                      bson *select, bson *update)
+{
+  mongo_sync_pool_connection *conn = NULL;
+  gboolean done   = FALSE;
+  int      ret    = RLM_MODULE_FAIL;
+
+  if (!update || !select) {
+    radlog_request (L_ERR, 0, request,
+                    "Invalid data for accounting update");
+    return RLM_MODULE_FAIL;
+  }
+
+  conn = mongodb_get_conn (inst);
+  if (!conn) {
+    radlog_request (L_ERR, 0, request, "Maximum %d connections exceeded; "
+                    "ignore accounting update", inst->numconns);
+    return RLM_MODULE_FAIL;
+  }
+
+  done = mongo_sync_cmd_update ((mongo_sync_connection *) conn,
+                                 inst->col_acct,
+                                 MONGO_WIRE_FLAG_UPDATE_UPSERT |
+                                   MONGO_WIRE_FLAG_UPDATE_MULTI,
+                                 select, update);
+
+  if (done == TRUE) {
+    ret = RLM_MODULE_OK;
+  } else {
+    gchar *error = NULL;
+    mongo_sync_cmd_get_last_error ((mongo_sync_connection *) conn,
+                                   inst->database, &error);
+    radlog_request (L_ERR, 0, request,
+                    "MongoDB accounting update error; [%s]", error);
+    mongo_sync_cmd_reset_error ((mongo_sync_connection *) conn,
+                                inst->database);
+    ret = RLM_MODULE_FAIL;
+  }
+
+  if (mongodb_return_conn (inst, conn) == -1) {
+    radlog_request (L_ERR, 0, request,
+                    "The connection was not returned to the pool");
+    return RLM_MODULE_FAIL;
+  }
+
+  return ret;
+}
+
+static int64_t _get_request_timestamp (REQUEST *request)
+{
+  VALUE_PAIR *acct_delay_time = pairfind (request->packet->vps,
+                                          PW_ACCT_DELAY_TIME);
+  struct timeval tval;
+  int64_t timestamp = 0;
+  int     delay     = 0;
+
+  gettimeofday (&tval, NULL);
+  timestamp = tval.tv_sec * 1000 + tval.tv_usec / 1000; /* milliseconds */
+
+  if (acct_delay_time) {
+    delay = acct_delay_time->vp_integer * 1000; /* milliseconds */
+  }
+
+  timestamp -= delay;
+  return timestamp;
+}
+
+static int mongodb_accounting_start (MONGODB_INST *inst, REQUEST *request)
+{
+  VALUE_PAIR *vp     = request->packet->vps;
+  const char *attr   = NULL;
+  bson       *select = NULL;
+  bson       *update = NULL;
+  bson       *updset = NULL;
+  int         ret    = 0;
+  char        value[MAX_STRING_LEN + 1];
+
+  VALUE_PAIR *username = pairfind (request->packet->vps, PW_USER_NAME);
+  VALUE_PAIR *sessid  = pairfind (request->packet->vps, PW_ACCT_SESSION_ID);
+  VALUE_PAIR *nasip   = pairfind (request->packet->vps, PW_NAS_IP_ADDRESS);
+  VALUE_PAIR *nasport = pairfind (request->packet->vps, PW_NAS_PORT);
+
+  if (!username || !sessid || !nasip || !nasport) {
+    radlog_request (L_ERR, 0, request, "packet has no User-Name and/or "
+                    "no Acct-Session-ID");
+    return RLM_MODULE_INVALID;
+  }
+
+  select = bson_new ();
+  bson_append_string (select, username->name, username->vp_strvalue, -1);
+  bson_append_string (select, sessid->name, sessid->vp_strvalue, -1);
+  vp_prints_value (value, sizeof (value), nasip, 0);
+  bson_append_string (select, nasip->name, value, -1);
+  bson_append_int32 (select, nasport->name, nasport->vp_integer);
+  bson_append_null (select, "Acct-Session-Stop-Time");
+  bson_finish (select);
+
+  update = bson_new ();
+
+  VALUE_PAIR *it = vp;
+  while (it) {
+    attr  = it->name;
+
+    switch (it->type) {
+      case PW_TYPE_INTEGER:
+      case PW_TYPE_BYTE:
+      case PW_TYPE_SHORT:
+        bson_append_int32 (update, attr, it->vp_integer);
+        break;
+      case PW_TYPE_DATE:
+        bson_append_utc_datetime (update, attr, it->vp_date);
+        break;
+      default:
+        vp_prints_value (value, sizeof (value), it, 0);
+        bson_append_string (update, attr, value, -1);
+        break;
+    }
+
+    it = it->next;
+  }
+
+  int64_t timestamp = _get_request_timestamp (request);
+  bson_append_utc_datetime (update, "Acct-Session-Start-Time", timestamp);
+  bson_finish (update);
+
+  updset = bson_new ();
+  bson_append_document (updset, "$set", update);
+  bson_finish (updset);
+
+  ret = mongodb_accounting_update (inst, request, select, updset);
+
+  bson_free (updset);
+  bson_free (update);
+  bson_free (select);
+
+  return ret;
+}
+
+static int mongodb_accounting (void *instance, REQUEST *request) {
+  MONGODB_INST *inst  = instance;
+  int  acctstatustype = 0;
+  int  ret            = RLM_MODULE_NOOP;
+  char logstr[MAX_STRING_LEN];
+
+  VALUE_PAIR *pair = pairfind (request->packet->vps, PW_ACCT_STATUS_TYPE);
+  if (pair) {
+    acctstatustype = pair->vp_integer;
+  } else {
+    radius_xlat (logstr, sizeof (logstr), "packet has no accounting status"
+                 "type. [user '%{User-Name}', nas '%{NAS-IP-Address}']",
+                 request, NULL);
+    radlog_request (L_ERR, 0, request, "%s", logstr);
+    return RLM_MODULE_INVALID;
+  }
+
+  switch (acctstatustype) {
+    case PW_STATUS_START:
+      ret = mongodb_accounting_start (inst, request);
+      break;
+    case PW_STATUS_STOP:
+      break;
+    case PW_STATUS_ALIVE:
+      break;
+    case PW_STATUS_ACCOUNTING_ON:
+    case PW_STATUS_ACCOUNTING_OFF:
+      break;
+    default:
+      RDEBUG ("Unsupported Acct-Status-Type = %d", acctstatustype);
+      return RLM_MODULE_NOOP;
+  }
+
+  return ret;
+}
+
 module_t rlm_mongodb = {
   RLM_MODULE_INIT,
   "mongodb",
@@ -649,7 +828,7 @@ module_t rlm_mongodb = {
     NULL, /* authentication */
     mongodb_authorize, /* authorization */
     NULL, /* preaccounting */
-    NULL, /* accounting */
+    mongodb_accounting, /* accounting */
     NULL, /* checksimul */
     NULL, /* pre-proxy */
     NULL, /* post-proxy */
