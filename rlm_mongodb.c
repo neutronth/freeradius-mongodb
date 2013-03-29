@@ -645,7 +645,8 @@ out:
 }
 
 static int mongodb_accounting_update (MONGODB_INST *inst, REQUEST *request,
-                                      bson *select, bson *update)
+                                      bson *select, bson *update,
+                                      gint32 flags)
 {
   mongo_sync_pool_connection *conn = NULL;
   gboolean done   = FALSE;
@@ -665,10 +666,7 @@ static int mongodb_accounting_update (MONGODB_INST *inst, REQUEST *request,
   }
 
   done = mongo_sync_cmd_update ((mongo_sync_connection *) conn,
-                                 inst->col_acct,
-                                 MONGO_WIRE_FLAG_UPDATE_UPSERT |
-                                   MONGO_WIRE_FLAG_UPDATE_MULTI,
-                                 select, update);
+                                 inst->col_acct, flags, select, update);
 
   if (done == TRUE) {
     ret = RLM_MODULE_OK;
@@ -773,8 +771,177 @@ static int mongodb_accounting_start (MONGODB_INST *inst, REQUEST *request)
   bson_append_document (updset, "$set", update);
   bson_finish (updset);
 
-  ret = mongodb_accounting_update (inst, request, select, updset);
+  ret = mongodb_accounting_update (inst, request, select, updset,
+                                   MONGO_WIRE_FLAG_UPDATE_UPSERT);
 
+  bson_free (updset);
+  bson_free (update);
+  bson_free (select);
+
+  return ret;
+}
+
+static int mongodb_accounting_prestop (MONGODB_INST *inst,
+                                       REQUEST *request, bson *query,
+                                       int64_t *starttime,
+                                       int64_t *stoptime,
+                                       int64_t *sesstime)
+{
+  int     found         = 0;
+  int64_t doc_starttime = 0;
+  mongo_sync_pool_connection *conn = mongodb_get_conn (inst);
+  mongo_sync_cursor *sc     = NULL;
+  mongo_packet      *p      = NULL;
+  bson              *select = NULL;
+
+  if (!conn) {
+    radlog_request (L_ERR, 0, request, "Maximum %d connections exceeded; "
+                    "rejecting user", inst->numconns);
+    return -1;
+  }
+
+  select = bson_build (BSON_TYPE_INT32, "Acct-Session-Start-Time", 1,
+                       BSON_TYPE_NONE);
+  bson_finish (select);
+
+  p = mongo_sync_cmd_query ((mongo_sync_connection *) conn, inst->col_acct,
+                            0, 0, 1, query, select);
+
+  if (!p) {
+    found = 0;
+    goto out;
+  }
+
+  sc = mongo_sync_cursor_new ((mongo_sync_connection *) conn,
+                              inst->col_acct, p);
+
+  if (!sc) {
+    radlog_request (L_ERR, 0, request, "Error create new cursor");
+    found = -1;
+    goto out;
+  }
+
+  mongo_sync_cursor_next (sc);
+  bson *result = mongo_sync_cursor_get_data (sc);
+
+  if (!result) {
+    radlog_request (L_ERR, 0, request, "Could not get result");
+    found = -1;
+    goto out_cursor;
+  }
+
+  bson_cursor *doc = bson_find (result, "Acct-Session-Start-Time");
+  if (bson_cursor_type (doc) == BSON_TYPE_UTC_DATETIME) {
+    bson_cursor_get_utc_datetime (doc, &doc_starttime);
+    found = 1;
+  }
+  bson_cursor_free (doc);
+
+out_cursor:
+  bson_free (result);
+  mongo_sync_cursor_free (sc);
+
+out:
+  if (*sesstime == 0) {
+    *stoptime = _get_request_timestamp (request);
+    *sesstime = (*stoptime - doc_starttime) / 1000; /* seconds */
+    *starttime = doc_starttime;
+  } else {
+    if (doc_starttime > 0) {
+      *starttime = doc_starttime;
+      *stoptime  = doc_starttime + (*sesstime * 1000);
+    } else {
+      *stoptime = _get_request_timestamp (request);
+      *starttime = *stoptime - (*sesstime * 1000);
+    }
+  }
+
+  bson_free (select);
+
+  if (mongodb_return_conn (inst, conn) == -1) {
+    radlog_request (L_ERR, 0, request,
+                    "The connection was not returned to the pool");
+    return -1;
+  }
+
+  return found;
+}
+
+static int mongodb_accounting_stop (MONGODB_INST *inst, REQUEST *request)
+{
+  bson       *select = NULL;
+  bson       *update = NULL;
+  bson       *updset = NULL;
+  int         ret    = 0;
+  char        value[MAX_STRING_LEN + 1];
+
+  VALUE_PAIR *username = pairfind (request->packet->vps, PW_USER_NAME);
+  VALUE_PAIR *sessid  = pairfind (request->packet->vps, PW_ACCT_SESSION_ID);
+  VALUE_PAIR *nasip   = pairfind (request->packet->vps, PW_NAS_IP_ADDRESS);
+  VALUE_PAIR *nasport = pairfind (request->packet->vps, PW_NAS_PORT);
+  VALUE_PAIR *sstime = pairfind (request->packet->vps, PW_ACCT_SESSION_TIME);
+  VALUE_PAIR *tcause = pairfind (request->packet->vps, PW_ACCT_TERMINATE_CAUSE);
+
+  if (!username || !sessid || !nasip || !nasport || !tcause) {
+    radlog_request (L_ERR, 0, request, "packet has no some of required data"
+                    "User-Name, Acct-Session-Id, NAS-IP-Address, NAS-Port,"
+                    "Acct-Terminate-Cause");
+    return RLM_MODULE_INVALID;
+  }
+
+  select = bson_new ();
+  update = bson_new ();
+  updset = bson_new ();
+
+  bson_append_string (select, username->name, username->vp_strvalue, -1);
+  bson_append_string (select, sessid->name, sessid->vp_strvalue, -1);
+  vp_prints_value (value, sizeof (value), nasip, 0);
+  bson_append_string (select, nasip->name, value, -1);
+  bson_append_int32 (select, nasport->name, nasport->vp_integer);
+  bson_append_null (select, "Acct-Session-Stop-Time");
+  bson_finish (select);
+
+  int64_t starttime = 0;
+  int64_t stoptime  = 0;
+  int64_t sesstime  = 0;
+  int     found     = 0;
+
+  if (sstime) {
+    sesstime = sstime->vp_date;
+  }
+
+  found = mongodb_accounting_prestop (inst, request, select, &starttime,
+                                      &stoptime, &sesstime);
+
+  if (found < 0 || (found == 0 && sesstime == 0)) {
+    radlog_request (L_ERR, 0, request, "Could not update accounting (stop), "
+                    "no start record and could not re-generate "
+                    "or fail to get data");
+    ret = RLM_MODULE_FAIL;
+    goto out;
+  } else if (found == 0) {
+    /* no start record, just add one and update with calculated
+       starttime = stoptime - sessiontime */
+    ret = mongodb_accounting_start (inst, request);
+
+    if (ret != RLM_MODULE_OK) {
+      goto out;
+    }
+  }
+
+  bson_append_utc_datetime (update, "Acct-Session-Start-Time", starttime);
+  bson_append_utc_datetime (update, "Acct-Session-Stop-Time", stoptime);
+  bson_append_int32 (update, tcause->name, tcause->vp_integer);
+  bson_append_int32 (update, "Acct-Status-Type", PW_STATUS_STOP);
+  bson_append_int64 (update, "Acct-Session-Time", sesstime);
+  bson_finish (update);
+
+  bson_append_document (updset, "$set", update);
+  bson_finish (updset);
+
+  ret = mongodb_accounting_update (inst, request, select, updset, 0);
+
+out:
   bson_free (updset);
   bson_free (update);
   bson_free (select);
@@ -804,6 +971,7 @@ static int mongodb_accounting (void *instance, REQUEST *request) {
       ret = mongodb_accounting_start (inst, request);
       break;
     case PW_STATUS_STOP:
+      ret = mongodb_accounting_stop (inst, request);
       break;
     case PW_STATUS_ALIVE:
       break;
