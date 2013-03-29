@@ -111,7 +111,7 @@ static int mongodb_connection_setoptions (MONGODB_INST *inst)
   int i;
   for (i = 0; i < inst->numconns; i++) {
     conns[i] = mongo_sync_pool_pick (inst->pool, TRUE);
-    if (!conns) {
+    if (!conns[i]) {
       ret = -1;
       break;
     }
