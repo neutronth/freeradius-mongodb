@@ -988,6 +988,55 @@ static int mongodb_accounting (void *instance, REQUEST *request) {
   return ret;
 }
 
+static int mongodb_checksimul (void *instance, REQUEST *request)
+{
+  MONGODB_INST *inst = instance;
+  int ret = RLM_MODULE_NOOP;
+
+  if ((request->username == NULL) || (request->username->length == 0)) {
+    radlog_request (L_ERR, 0, request, "Zero length username not permitted");
+    return RLM_MODULE_INVALID;
+  }
+
+  mongo_sync_pool_connection *conn = mongodb_get_conn (inst);
+  bson    *query   = NULL;
+  gdouble  count   = 0;
+
+  if (!conn) {
+    radlog_request (L_ERR, 0, request, "Maximum %d connections exceeded; "
+                    "could not check simultaneous-use", inst->numconns);
+    return RLM_MODULE_FAIL;
+  }
+
+  query = bson_new ();
+  bson_append_string (query, request->username->name,
+                      request->username->vp_strvalue, -1);
+  bson_append_null (query, "Acct-Session-Stop-Time");
+  bson_finish (query);
+
+  count = mongo_sync_cmd_count ((mongo_sync_connection *) conn, inst->database,
+                                "acct", query);
+  bson_free (query);
+
+  if (count < 0) {
+    radlog_request (L_ERR, 0, request, "Could not get data; "
+                    "no simultaneous-use check");
+    ret = RLM_MODULE_FAIL;
+  } else {
+    RDEBUG ("Simultaneous count/max: %0.0f/%d", count, request->simul_max);
+    request->simul_count = (int) count;
+    ret = RLM_MODULE_OK;
+  }
+
+  if (mongodb_return_conn (inst, conn) == -1) {
+    radlog_request (L_ERR, 0, request,
+                    "The connection was not returned to the pool;");
+    return RLM_MODULE_FAIL;
+  }
+
+  return ret;
+}
+
 module_t rlm_mongodb = {
   RLM_MODULE_INIT,
   "mongodb",
@@ -999,7 +1048,7 @@ module_t rlm_mongodb = {
     mongodb_authorize, /* authorization */
     NULL, /* preaccounting */
     mongodb_accounting, /* accounting */
-    NULL, /* checksimul */
+    mongodb_checksimul, /* checksimul */
     NULL, /* pre-proxy */
     NULL, /* post-proxy */
     NULL  /* post-auth */
