@@ -54,6 +54,8 @@ typedef struct rlm_mongodb_t {
   char              col_groups[256];
   char              col_acct[256];
   int const         read_groups;
+  int const         verify_session;
+  int const         zap_stale_sessions;
 
 #ifdef HAVE_PTHREAD_H
   pthread_mutex_t   mutex;
@@ -73,6 +75,10 @@ static const CONF_PARSER module_config[] = {
     offsetof(MONGODB_INST, numconns), NULL, "10" },
   { "read_groups", PW_TYPE_BOOLEAN,
     offsetof(MONGODB_INST, read_groups), NULL, "yes" },
+  { "verify_session", PW_TYPE_BOOLEAN,
+    offsetof(MONGODB_INST, verify_session), NULL, "yes" },
+  { "zap_stale_sessions", PW_TYPE_BOOLEAN,
+    offsetof(MONGODB_INST, zap_stale_sessions), NULL, "yes" },
   { NULL, -1, 0, NULL, NULL } /* end of the list */
 };
 
@@ -884,10 +890,9 @@ static int mongodb_accounting_stop (MONGODB_INST *inst, REQUEST *request)
   VALUE_PAIR *sstime = pairfind (request->packet->vps, PW_ACCT_SESSION_TIME);
   VALUE_PAIR *tcause = pairfind (request->packet->vps, PW_ACCT_TERMINATE_CAUSE);
 
-  if (!username || !sessid || !nasip || !nasport || !tcause) {
-    radlog_request (L_ERR, 0, request, "packet has no some of required data"
-                    "User-Name, Acct-Session-Id, NAS-IP-Address, NAS-Port,"
-                    "Acct-Terminate-Cause");
+  if (!username || !sessid || !nasip || !nasport) {
+    radlog_request (L_ERR, 0, request, "packet has no some of required data "
+                    "User-Name, Acct-Session-Id, NAS-IP-Address, NAS-Port");
     return RLM_MODULE_INVALID;
   }
 
@@ -933,7 +938,11 @@ static int mongodb_accounting_stop (MONGODB_INST *inst, REQUEST *request)
 
   bson_append_utc_datetime (update, "Acct-Session-Start-Time", starttime);
   bson_append_utc_datetime (update, "Acct-Session-Stop-Time", stoptime);
-  bson_append_int32 (update, tcause->name, tcause->vp_integer);
+
+  if (tcause) {
+    bson_append_int32 (update, tcause->name, tcause->vp_integer);
+  }
+
   bson_append_int32 (update, "Acct-Status-Type", PW_STATUS_STOP);
   bson_append_int64 (update, "Acct-Session-Time", sesstime);
   bson_finish (update);
@@ -988,6 +997,179 @@ static int mongodb_accounting (void *instance, REQUEST *request) {
   return ret;
 }
 
+static uint32_t mongodb_cursor_get_addr (bson_cursor *cs)
+{
+  const gchar *addr_s = NULL;
+
+  if (!cs)
+    return 0;
+
+  bson_cursor_get_string (cs, &addr_s);
+  return inet_addr (addr_s);
+}
+
+static int mongodb_cursor_get_port (bson_cursor *cs)
+{
+  int port = 0;
+
+  if (!cs)
+    return 0;
+
+  bson_cursor_get_int32 (cs, &port);
+  return port;
+}
+
+static int mongodb_session_check (REQUEST *request, MONGODB_INST *inst,
+                                  const bson *session)
+{
+  bson_cursor *cs_username    = bson_find (session, "User-Name");
+  bson_cursor *cs_sessid      = bson_find (session, "Acct-Session-Id");
+  bson_cursor *cs_nas_addr    = bson_find (session, "NAS-IP-Address");
+  bson_cursor *cs_nas_port    = bson_find (session, "NAS-Port");
+  bson_cursor *cs_framed_addr = bson_find (session, "Framed-IP-Address");
+  int          ret            = 0;
+
+  if (!cs_username || !cs_sessid) {
+    RDEBUG ("Could not zap stale entry. No username or session id present in"
+            " entry.");
+    ret = 1;
+    goto out;
+  }
+
+  const gchar *username = NULL;
+  const gchar *sessid   = NULL;
+
+  if (bson_cursor_get_string (cs_username, &username) == FALSE ||
+      bson_cursor_get_string (cs_sessid, &sessid) == FALSE) {
+    RDEBUG ("Could not zap stale entry. Could not get username or session id.");
+    ret = 1;
+    goto out;
+  }
+
+  uint32_t nas_addr    = mongodb_cursor_get_addr (cs_nas_addr);
+  int      nas_port    = mongodb_cursor_get_port (cs_nas_port);
+  uint32_t framed_addr = mongodb_cursor_get_addr (cs_framed_addr);
+
+  int check = rad_check_ts (nas_addr, nas_port, username, sessid);
+
+  switch (check) {
+    case 0:
+      if (inst->zap_stale_sessions) {
+        char         proto        = 0;
+        int64_t      sess_time    = 0;
+        bson_cursor *cs_sess_time = bson_find (session, "Acct-Session-Time");
+
+        if (cs_sess_time)
+          bson_cursor_get_int64 (cs_sess_time, &sess_time);
+
+        session_zap (request, nas_addr, nas_port, username, sessid, framed_addr,
+                     proto, sess_time);
+
+        bson_cursor_free (cs_sess_time);
+      }
+      break;
+
+    case 1:
+      {
+        VALUE_PAIR  *vp          = NULL;
+        uint32_t     req_ip      = 0;
+        char        *req_callnum = NULL;
+        const gchar *callnum     = NULL;
+        bson_cursor *cs_callnum  = bson_find (session, "Calling-Station-Id");
+
+        ++request->simul_count;
+        vp = pairfind (request->packet->vps, PW_FRAMED_IP_ADDRESS);
+        if (vp)
+          req_ip = vp->vp_ipaddr;
+
+        vp = pairfind (request->packet->vps, PW_CALLING_STATION_ID);
+        if (vp)
+          req_callnum = vp->vp_strvalue;
+
+        if (cs_callnum)
+          bson_cursor_get_string (cs_callnum, &callnum);
+
+        if (framed_addr && req_ip && framed_addr == req_ip) {
+          request->simul_mpp = 2;
+        } else if (callnum && req_callnum &&
+                   strncmp (callnum, req_callnum, 16) != 0) {
+          request->simul_mpp = 2;
+        }
+
+        bson_cursor_free (cs_callnum);
+      }
+      break;
+
+    default:
+      radlog_request (L_ERR, 0, request, "Failed to check the terminal server "
+                      "for user '%s'.", username);
+      ret = 1;
+  }
+
+out:
+  bson_cursor_free (cs_username);
+  bson_cursor_free (cs_sessid);
+  bson_cursor_free (cs_nas_addr);
+  bson_cursor_free (cs_nas_port);
+  bson_cursor_free (cs_framed_addr);
+
+  return ret;
+}
+
+static int mongodb_session_verify (mongo_sync_connection *conn,
+                                   MONGODB_INST *inst, REQUEST *request)
+{
+  int                ret    = RLM_MODULE_OK;
+  bson              *query  = NULL;
+  mongo_packet      *p      = NULL;
+  mongo_sync_cursor *sc     = NULL;
+
+  query = bson_new ();
+  bson_append_string (query, request->username->name,
+                      request->username->vp_strvalue, -1);
+  bson_append_null (query, "Acct-Session-Stop-Time");
+  bson_finish (query);
+
+  p = mongo_sync_cmd_query (conn, inst->col_acct, 0, 0, INT_MAX, query, NULL);
+
+  if (!p) {
+    ret = RLM_MODULE_FAIL;
+    goto out;
+  }
+
+  sc = mongo_sync_cursor_new (conn, inst->col_acct, p);
+  if (!sc) {
+    radlog_request (L_ERR, 0, request, "Error create new cursor");
+    ret = RLM_MODULE_FAIL;
+    mongo_wire_packet_free (p);
+    goto out;
+  }
+
+  int fail = 0;
+
+  request->simul_count = 0;
+
+  while (mongo_sync_cursor_next (sc) && !fail) {
+    bson *result = mongo_sync_cursor_get_data (sc);
+
+    if (result) {
+      fail = mongodb_session_check (request, inst, result);
+
+      if (fail)
+        ret = RLM_MODULE_FAIL;
+    }
+
+    bson_free (result);
+  }
+
+  mongo_sync_cursor_free (sc);
+
+out:
+  bson_free (query);
+
+  return ret;
+}
+
 static int mongodb_checksimul (void *instance, REQUEST *request)
 {
   MONGODB_INST *inst = instance;
@@ -1022,12 +1204,19 @@ static int mongodb_checksimul (void *instance, REQUEST *request)
     radlog_request (L_ERR, 0, request, "Could not get data; "
                     "no simultaneous-use check");
     ret = RLM_MODULE_FAIL;
+    goto out;
+  }
+
+  RDEBUG ("Simultaneous count/max: %0.0f/%d", count, request->simul_max);
+  request->simul_count = (int) count;
+
+  if (request->simul_count >= request->simul_max && inst->verify_session) {
+    ret = mongodb_session_verify ((mongo_sync_connection *)conn, inst, request);
   } else {
-    RDEBUG ("Simultaneous count/max: %0.0f/%d", count, request->simul_max);
-    request->simul_count = (int) count;
     ret = RLM_MODULE_OK;
   }
 
+out:
   if (mongodb_return_conn (inst, conn) == -1) {
     radlog_request (L_ERR, 0, request,
                     "The connection was not returned to the pool;");
